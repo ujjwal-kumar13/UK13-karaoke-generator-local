@@ -1,0 +1,10 @@
+numpy
+certifi
+torch
+torchaudio
+librosa
+openai-whisper
+demucs
+ctc-forced-aligner
+transformers
+Pillow
