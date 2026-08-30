@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import os
 import re
 import sys
@@ -16,6 +17,12 @@ try:
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
 except ImportError:
     pass
+
+try:
+    from num2words import num2words
+    _NUM2WORDS_AVAILABLE = True
+except ImportError:
+    _NUM2WORDS_AVAILABLE = False
 
 # ============================================================================
 # CONFIG
@@ -188,6 +195,13 @@ class Config:
     MAX_NO_SPEECH_PROB_FOR_DROP = 0.85
     MERGE_SEGMENT_GAP = 0.8
 
+    # A bare 4-digit numeral in this range is spelled out as a year
+    # ("1969" -> "nineteen sixty-nine") rather than a plain cardinal count
+    # ("one thousand nine hundred sixty-nine") before the aligner's vocab
+    # check -- see _numeral_to_words(). Numbers outside this range (or not
+    # 4 digits) are read as plain cardinals.
+    NUMERAL_YEAR_RANGE = (1000, 2999)
+
     DEMUCS_MODEL = "htdemucs"
 
     # Advanced: set these directly if you ever need to trim (prompts removed)
@@ -351,35 +365,178 @@ def _strip_alignment_noise_chars(text):
     return text
 
 
-def forced_align_lyrics(vocals_path, lyric_lines_text, language, device, out_dir=None, vocal_window=None):
-    import torch
-    from ctc_forced_aligner import (
-        load_audio, load_alignment_model, generate_emissions,
-        preprocess_text, get_alignments, get_spans, postprocess_results,
-    )
+_ORDINAL_SUFFIX_RE = re.compile(r"^(\d+)(st|nd|rd|th)$", re.IGNORECASE)
 
-    # Build a cleaned copy of the lyrics used ONLY for the vocab check and
-    # the actual alignment call -- quote characters stripped (see
-    # _strip_alignment_noise_chars docstring for why). The ORIGINAL
-    # lyric_lines_text (with quotes intact) is still used below for every
-    # line's displayed "text" field and its ad-lib-parens check --
-    # unaffected. Per-line word counts are computed from the SAME cleaned
-    # text used for alignment (not the original), so a line where
-    # stripping removed an entire orphaned quote "word" doesn't desync
-    # downstream line-to-word slicing.
-    alignment_lyric_lines = [
-        " ".join(_strip_alignment_noise_chars(lt).split()) for lt in lyric_lines_text
-    ]
-    stripped_count = sum(
-        1 for orig, clean in zip(lyric_lines_text, alignment_lyric_lines) if orig != clean
+
+def _split_edge_punct(word):
+    """Splits a word into (leading_punct, core, trailing_punct), where
+    leading/trailing punct is any run of non-alphanumeric characters at
+    the very start/end of the word only -- internal punctuation is left
+    inside `core` untouched. E.g. "8," -> ("", "8", ","), "(mm-mm)" ->
+    ("(", "mm-mm", ")"). Used to find the actual numeral inside a word
+    without disturbing surrounding punctuation."""
+    i = 0
+    while i < len(word) and not word[i].isalnum():
+        i += 1
+    j = len(word)
+    while j > i and not word[j - 1].isalnum():
+        j -= 1
+    return word[:i], word[i:j], word[j:]
+
+
+def _line_has_bare_numeral(text):
+    """True if `text` contains at least one word that
+    _convert_numerals_for_alignment() would actually convert (a pure
+    numeral, or a numeral with an ordinal suffix) -- used only to decide
+    whether it's worth warning that num2words isn't installed (see
+    prepare_alignment_text()). Cheap, no dependency on num2words itself,
+    safe to call regardless of _NUM2WORDS_AVAILABLE."""
+    for word in text.split(" "):
+        if not word:
+            continue
+        _, core, _ = _split_edge_punct(word)
+        if _ORDINAL_SUFFIX_RE.match(core) or core.isdigit():
+            return True
+    return False
+
+
+def _numeral_to_words(digits, is_ordinal):
+    """Spells out a bare digit string for the aligner. 4-digit numbers in
+    Config.NUMERAL_YEAR_RANGE are read as years ("1969" -> "nineteen
+    sixty-nine") rather than a plain cardinal count, matching the
+    guidance already baked into the vocab pre-flight's own error
+    message; everything else is a plain cardinal or ordinal reading."""
+    n = int(digits)
+    if is_ordinal:
+        return num2words(n, to="ordinal")
+    lo, hi = Config.NUMERAL_YEAR_RANGE
+    if len(digits) == 4 and lo <= n <= hi:
+        return num2words(n, to="year")
+    return num2words(n)
+
+
+def _convert_numerals_for_alignment(text):
+    """Spells out bare numeral words (e.g. "8" -> "eight", "85" ->
+    "eighty-five", "1969" -> "nineteen sixty-nine", "21st" ->
+    "twenty-first") for the SAME reason _strip_alignment_noise_chars()
+    exists: a bare digit sequence typically has no romanized form at all,
+    which fails the aligner's vocab pre-flight check and aborts forced
+    alignment for the WHOLE song, falling back to the much less accurate
+    proportional-timing method -- confirmed directly against two real
+    failing songs on the local-batch branch ("Eldest Daughter":
+    word='8'/word='9'; "Ruin The Friendship": word='85'/word='50'), both
+    of which hit exactly this and nothing else (their lyrics also
+    contained parentheses and straight apostrophes, neither of which was
+    flagged -- so this fix is scoped to the failure actually observed,
+    not a guess). This branch shares the identical forced_align_lyrics()
+    vocab-check code, so it's equally exposed.
+
+    Only whole numeral tokens are converted: a word that, once leading/
+    trailing punctuation is stripped, is either pure digits or digits
+    plus an ordinal suffix (21st, 3rd). A word that mixes letters and
+    digits some other way (e.g. "24/7", a stylized word) is left
+    untouched -- there's no safe generic way to guess how to romanize
+    that, and it isn't the failure mode observed.
+
+    IMPORTANT DISPLAY NOTE: this conversion (and the existing quote-
+    stripping) DOES change what's shown on screen for that word once
+    forced alignment succeeds -- the per-word captions render_video()
+    draws come from the aligner's own word output (built from this
+    cleaned text), not from your original raw lyrics line. So a line
+    like "I must've been about 8 or 9" will display as "... about eight
+    or nine" once real alignment runs, not "8 or 9" as typed. Confirmed
+    by reading ctc_forced_aligner's own preprocess_text()/
+    postprocess_results() source.
+
+    Silently returns text unchanged if the num2words package isn't
+    installed (see _NUM2WORDS_AVAILABLE) -- this must never be able to
+    crash the pipeline outright over a missing optional dependency.
+    """
+    if not _NUM2WORDS_AVAILABLE:
+        return text
+
+    out_words = []
+    for word in text.split(" "):
+        if not word:
+            continue
+        lead, core, trail = _split_edge_punct(word)
+        ordinal_m = _ORDINAL_SUFFIX_RE.match(core)
+        if ordinal_m:
+            spelled = _numeral_to_words(ordinal_m.group(1), is_ordinal=True)
+        elif core.isdigit():
+            spelled = _numeral_to_words(core, is_ordinal=False)
+        else:
+            out_words.append(word)
+            continue
+        out_words.append(f"{lead}{spelled}{trail}")
+    return " ".join(out_words)
+
+
+def _clean_line_for_alignment(line_text):
+    """Returns the version of one lyrics line actually sent to the
+    aligner's vocab check/alignment call: quote characters stripped
+    (_strip_alignment_noise_chars), then bare numerals spelled out
+    (_convert_numerals_for_alignment), with whitespace normalized. The
+    original, untouched line_text is still what's used for the LINE-level
+    "text" field (is_adlib detection, the whole-line preview) -- see
+    prepare_alignment_text()'s docstring for what this does and does not
+    affect."""
+    cleaned = _strip_alignment_noise_chars(line_text)
+    cleaned = _convert_numerals_for_alignment(cleaned)
+    return " ".join(cleaned.split())
+
+
+def prepare_alignment_text(lyric_lines_text, language):
+    """Builds the cleaned per-line text sent to the forced aligner and
+    checks it against the aligner's vocabulary, raising the same
+    ValueError (with the same fix-it guidance) forced_align_lyrics() has
+    always given if anything still fails. Called from two places: early,
+    right after the lyrics file loads -- purely so a lyrics-text problem
+    surfaces in seconds, before Demucs separation and a coarse Whisper
+    pass run for nothing -- and again inside forced_align_lyrics()
+    itself, right before the real alignment call, which is the one that
+    actually matters for correctness. Calling it twice is cheap (text
+    cleaning plus one vocabulary lookup, not a model inference) and keeps
+    both call sites guaranteed to agree, rather than duplicating the
+    cleaning logic in two places that could drift apart.
+
+    Returns (alignment_lyric_lines, full_text). Prints a one-line note
+    when any line was actually changed by cleaning, so it's clear from
+    the console that this ran and what it affected -- including the
+    display-text caveat from _convert_numerals_for_alignment()'s
+    docstring, so it isn't a surprise later.
+
+    If num2words isn't importable, numeral conversion silently does
+    nothing (see _convert_numerals_for_alignment) -- that was confirmed
+    as a real, previously-undetected failure mode on the local-batch
+    branch (a re-run showed the exact same vocab failures as before the
+    fix, with no adjustment note anywhere in the log, because the
+    package was never installed in that environment). So this checks
+    explicitly and prints a loud, impossible-to-miss warning naming the
+    missing package, instead of quietly doing nothing.
+    """
+    if not _NUM2WORDS_AVAILABLE and any(_line_has_bare_numeral(lt) for lt in lyric_lines_text):
+        print("  " + "!" * 68)
+        print("  WARNING: this lyrics file contains bare numeral(s) (e.g. \"8\", \"85\") and the "
+              "'num2words' package is NOT installed in this Python environment -- numerals will "
+              "NOT be spelled out, and the vocab pre-flight check below will very likely fail "
+              "on them, falling back to the less accurate Whisper-based timing method. Fix: run "
+              "'pip install num2words' in the SAME environment you run this script with (the "
+              "one whose 'python' this is), then re-run.")
+        print("  " + "!" * 68)
+
+    alignment_lyric_lines = [_clean_line_for_alignment(lt) for lt in lyric_lines_text]
+    changed_count = sum(
+        1 for orig, clean in zip(lyric_lines_text, alignment_lyric_lines)
+        if " ".join(orig.split()) != clean
     )
-    if stripped_count:
-        print(f"  Note: removed quote character(s) from {stripped_count} lyrics line(s) before "
-              f"alignment (quotes carry no sung sound and can break the aligner's vocab check) -- "
-              f"on-screen captions are unaffected, this only changes what's fed to the aligner.")
+    if changed_count:
+        print(f"  Note: adjusted {changed_count} lyrics line(s) for the aligner (quote "
+              f"character(s) removed and/or bare numeral(s) spelled out, e.g. \"8\" -> "
+              f"\"eight\") -- an adjusted word's on-screen caption will show the adjusted "
+              f"wording once alignment succeeds, not your original digits/quotes.")
 
     full_text = " ".join(alignment_lyric_lines)
-
     print("  Pre-flight: checking lyrics text against aligner vocabulary...")
     problems = check_vocab_coverage(full_text, language)
     if problems:
@@ -392,6 +549,30 @@ def forced_align_lyrics(vocals_path, lyric_lines_text, language, device, out_dir
               "spelling it out in words (e.g. \"nineteen sixty-nine\") in the lyrics file instead.")
         raise ValueError(f"{len(problems)} word(s) failed the vocab pre-flight check -- see above.")
     print("  Pre-flight OK.")
+    return alignment_lyric_lines, full_text
+
+
+def forced_align_lyrics(vocals_path, lyric_lines_text, language, device, out_dir=None, vocal_window=None):
+    import torch
+    from ctc_forced_aligner import (
+        load_audio, load_alignment_model, generate_emissions,
+        preprocess_text, get_alignments, get_spans, postprocess_results,
+    )
+
+    # Build the cleaned copy of the lyrics used ONLY for the vocab check
+    # and the actual alignment call -- quote characters stripped and bare
+    # numerals spelled out (see prepare_alignment_text() and its helpers
+    # for the full rationale; this was already run once earlier, right
+    # after the lyrics file loaded, purely to surface a problem before
+    # audio processing started -- re-run here since this is the call that
+    # actually matters for correctness). The ORIGINAL lyric_lines_text is
+    # still used below for every line's LINE-level "text" field and its
+    # ad-lib-parens check -- unaffected. Per-line word counts are computed
+    # from the SAME cleaned text used for alignment (not the original), so
+    # a line whose word count changed during cleaning (a stray quote
+    # "word" removed, or a numeral expanding into multiple words) doesn't
+    # desync downstream line-to-word slicing.
+    alignment_lyric_lines, full_text = prepare_alignment_text(lyric_lines_text, language)
 
     # --- Optional: narrow the aligner's input audio to the coarse
     # vocal-activity window detected earlier from raw pre-separation audio
@@ -1589,13 +1770,46 @@ def main():
     print("=" * 70)
     print("  KARAOKE VIDEO GENERATOR v7 (main_v2)")
     print("=" * 70)
+    # Printed unconditionally, right at startup -- so it's impossible to
+    # miss whether the 2026-08-25 numeral-spelling fix is actually active
+    # this run, rather than only discovering it's not (silently) deep in
+    # a lyrics file's vocab pre-flight failure.
+    if _NUM2WORDS_AVAILABLE:
+        print("  num2words: available (bare numerals in lyrics will be spelled out for alignment)")
+    else:
+        print("  num2words: NOT INSTALLED in this Python environment -- bare numerals ('8', '85', "
+              "etc.) in lyrics files will NOT be spelled out and will likely fail the vocab "
+              "pre-flight check. Run 'pip install num2words' in this same environment to fix.")
 
     video_path = prompt_path("\nEnter path to the input video file (.mp4): ")
 
     has_lyrics = input("\nDo you have a lyrics .txt file? (y/n): ").strip().lower().startswith("y")
-    lyrics_path = None
+    # Lyrics are loaded and vocab-pre-checked here, right at setup time
+    # (added 2026-08-25) -- previously this only happened deep inside
+    # forced_align_lyrics(), after Demucs separation and a coarse Whisper
+    # pass had already run. Checking now costs a few seconds (text
+    # cleaning + one vocabulary lookup, no audio/model work) and surfaces
+    # a lyrics-text problem immediately, before you walk away from a run
+    # that's going to fail anyway. This does NOT abort -- forced_align_
+    # lyrics() still runs its own copy of this same check later and, if
+    # the problem wasn't fixed, falls back to Whisper-based timing exactly
+    # as before.
+    lyric_lines_text = None
     if has_lyrics:
         lyrics_path = prompt_path("Enter path to the lyrics .txt file (one line per lyric line): ")
+        lyric_lines_text = read_lyrics_txt(lyrics_path)
+        print(f"  Loaded {len(lyric_lines_text)} lyric line(s) from file.")
+        print("  Pre-checking lyrics text against the aligner's vocabulary before starting "
+              "audio processing...")
+        try:
+            prepare_alignment_text(lyric_lines_text, Config.FORCED_ALIGN_LANGUAGE)
+            print("  Lyrics text pre-check passed.")
+        except Exception as e:
+            print(f"  WARNING: lyrics text pre-check failed ({e}). Continuing anyway -- "
+                  f"forced alignment will very likely fail again once audio processing reaches "
+                  f"it, and this song will fall back to the less accurate Whisper-based timing "
+                  f"method. Fix the lyrics file now to avoid that, or let this run finish and "
+                  f"re-run once it's fixed.")
     else:
         print("No lyrics file -- will attempt automatic transcription with Whisper.")
 
@@ -1635,9 +1849,7 @@ def main():
 
     print("\n[3/6] Building lyric timing...")
     lines = None
-    if lyrics_path:
-        lyric_lines_text = read_lyrics_txt(lyrics_path)
-        print(f"  Loaded {len(lyric_lines_text)} lyric line(s) from file.")
+    if lyric_lines_text is not None:
         print("  Scanning the raw (pre-separation) audio for the vocal-activity window, to "
               "anchor forced alignment and avoid drift across leading/trailing instrumental...")
         vocal_window = detect_vocal_window(audio_path)
